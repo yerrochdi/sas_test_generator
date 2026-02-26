@@ -1,0 +1,49 @@
+# =============================================================================
+# Configuration des projets SAS à traiter
+#
+# Chaque projet définit:
+#   - repo:          URL du repo GitLab (HTTPS ou SSH)
+#   - branch:        branche à cloner (défaut: main)
+#   - entry:         fichier SAS d'entrée principal
+#   - include_paths: répertoires supplémentaires pour résoudre les %INCLUDE
+#   - macro_vars:    variables macro SAS à définir (&VAR.)
+#   - rows:          nombre de lignes à générer (défaut: 30)
+#   - enabled:       true/false pour activer/désactiver un projet
+# =============================================================================
+
+projects:
+
+  # --- Exemple 1: Projet de scoring client ---
+  - name: scoring-client
+    repo: https://gitlab.example.com/sas-projects/scoring-client.git
+    branch: main
+    entry: programmes/main.sas
+    include_paths:
+      - macros/
+      - includes/
+    macro_vars:
+      ENV: RECETTE
+      ROOT: .
+    rows: 50
+    enabled: true
+
+  # --- Exemple 2: Projet de reporting mensuel ---
+  - name: reporting-mensuel
+    repo: https://gitlab.example.com/sas-projects/reporting-mensuel.git
+    branch: develop
+    entry: src/main_report.sas
+    include_paths:
+      - src/macros/
+      - lib/
+    macro_vars:
+      MOIS_REF: "202601"
+      ENV: RECETTE
+    rows: 40
+    enabled: true
+
+  # --- Exemple 3: Projet désactivé ---
+  - name: ancien-projet
+    repo: https://gitlab.example.com/sas-projects/ancien-projet.git
+    branch: main
+    entry: main.sas
+    enabled: false

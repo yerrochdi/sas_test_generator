@@ -1,0 +1,202 @@
+# =============================================================================
+# GitLab CI/CD — Pipeline Central de Génération de Données de Test SAS
+#
+# Ce pipeline est autonome : il clone chaque projet SAS listé dans
+# projects.yml, puis génère les datasets de test pour chacun.
+#
+# Aucune modification des repos SAS existants n'est nécessaire.
+#
+# Déclenchement:
+#   - Automatique: sur push/merge dans ce repo
+#   - Planifié:    configurer un schedule GitLab (ex: tous les lundis)
+#   - Manuel:      via l'interface GitLab (bouton "Run pipeline")
+#
+# Variables CI/CD à configurer dans Settings > CI/CD > Variables:
+#   - GITLAB_TOKEN:     token avec accès read aux repos SAS (si privés)
+#   - SAS_EXECUTABLE:   chemin vers SAS (si pas sur PATH)
+# =============================================================================
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # URL de l'outil (modifier si hébergé en interne)
+  TOOL_REPO: "https://github.com/yerrochdi/sas_test_generator.git"
+
+stages:
+  - setup
+  - generate
+  - coverage
+  - report
+
+# ---------------------------------------------------------------------------
+# Stage: setup — Installer l'outil
+# ---------------------------------------------------------------------------
+
+install-tool:
+  stage: setup
+  image: python:3.11-slim
+  script:
+    - pip install --upgrade pip
+    - pip install "git+${TOOL_REPO}"
+    - pip install pyyaml
+    - sas-datagen --help
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .pip-cache/
+
+# ---------------------------------------------------------------------------
+# Stage: generate — Générer les datasets (sans SAS)
+# ---------------------------------------------------------------------------
+
+generate-datasets:
+  stage: generate
+  image: python:3.11-slim
+  before_script:
+    - apt-get update && apt-get install -y git
+    - pip install --upgrade pip
+    - pip install "git+${TOOL_REPO}"
+    - pip install pyyaml
+    # Configurer git pour les repos privés (si GITLAB_TOKEN est défini)
+    - |
+      if [ -n "${GITLAB_TOKEN:-}" ]; then
+        git config --global url."https://gitlab-ci-token:${GITLAB_TOKEN}@gitlab.example.com/".insteadOf "https://gitlab.example.com/"
+      fi
+  script:
+    - chmod +x scripts/generate.sh
+    - ./scripts/generate.sh --config projects.yml --output output --dry-run --verbose
+  artifacts:
+    paths:
+      - output/
+    expire_in: 2 weeks
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .pip-cache/
+
+# ---------------------------------------------------------------------------
+# Stage: coverage — Exécuter SAS et mesurer la couverture
+# ---------------------------------------------------------------------------
+
+run-sas-coverage:
+  stage: coverage
+  tags:
+    - sas
+  before_script:
+    - pip install --upgrade pip
+    - pip install "git+${TOOL_REPO}"
+    - pip install pyyaml
+    - |
+      if [ -n "${GITLAB_TOKEN:-}" ]; then
+        git config --global url."https://gitlab-ci-token:${GITLAB_TOKEN}@gitlab.example.com/".insteadOf "https://gitlab.example.com/"
+      fi
+  script:
+    - chmod +x scripts/generate.sh
+    - ./scripts/generate.sh --config projects.yml --output output --verbose
+  artifacts:
+    when: always
+    paths:
+      - output/
+    expire_in: 1 month
+  rules:
+    - when: manual
+  allow_failure: true
+  needs:
+    - generate-datasets
+
+# Traiter un seul projet (utile pour debug)
+run-single-project:
+  stage: coverage
+  tags:
+    - sas
+  before_script:
+    - pip install --upgrade pip
+    - pip install "git+${TOOL_REPO}"
+    - pip install pyyaml
+    - |
+      if [ -n "${GITLAB_TOKEN:-}" ]; then
+        git config --global url."https://gitlab-ci-token:${GITLAB_TOKEN}@gitlab.example.com/".insteadOf "https://gitlab.example.com/"
+      fi
+  script:
+    - chmod +x scripts/generate.sh
+    - ./scripts/generate.sh --config projects.yml --output output --project "$PROJECT_NAME" --verbose
+  artifacts:
+    when: always
+    paths:
+      - output/
+    expire_in: 1 month
+  rules:
+    - when: manual
+  variables:
+    PROJECT_NAME: ""
+
+# ---------------------------------------------------------------------------
+# Stage: report — Rapport de synthèse
+# ---------------------------------------------------------------------------
+
+summary-report:
+  stage: report
+  image: python:3.11-slim
+  script:
+    - |
+      echo "============================================="
+      echo "  Rapport de Génération — $(date '+%Y-%m-%d')"
+      echo "============================================="
+      echo ""
+
+      for project_dir in output/*/; do
+        if [ -d "$project_dir" ]; then
+          project_name=$(basename "$project_dir")
+          echo "--- Projet: $project_name ---"
+
+          # Compter les datasets générés
+          csv_count=$(find "$project_dir" -name "*.csv" 2>/dev/null | wc -l)
+          echo "  Datasets CSV: $csv_count"
+
+          # Afficher le rapport de couverture s'il existe
+          for report in "$project_dir"/*_coverage_report.txt; do
+            if [ -f "$report" ]; then
+              echo "  Couverture:"
+              sed 's/^/    /' "$report"
+            fi
+          done
+
+          echo ""
+        fi
+      done
+  artifacts:
+    when: always
+    paths:
+      - output/
+    expire_in: 1 month
+  needs:
+    - job: run-sas-coverage
+      optional: true
+    - job: generate-datasets
+      optional: true
+
+# ---------------------------------------------------------------------------
+# Scheduled: Exécution planifiée (configurer dans CI/CD > Schedules)
+# ---------------------------------------------------------------------------
+
+scheduled-generation:
+  stage: generate
+  image: python:3.11-slim
+  before_script:
+    - apt-get update && apt-get install -y git
+    - pip install --upgrade pip
+    - pip install "git+${TOOL_REPO}"
+    - pip install pyyaml
+    - |
+      if [ -n "${GITLAB_TOKEN:-}" ]; then
+        git config --global url."https://gitlab-ci-token:${GITLAB_TOKEN}@gitlab.example.com/".insteadOf "https://gitlab.example.com/"
+      fi
+  script:
+    - chmod +x scripts/generate.sh
+    - ./scripts/generate.sh --config projects.yml --output output --dry-run --verbose
+  artifacts:
+    paths:
+      - output/
+    expire_in: 1 month
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'

@@ -15,7 +15,8 @@
 4. [Le pipeline GitLab CI](#4-le-pipeline-gitlab-ci)
 5. [Exemple concret de bout en bout](#5-exemple-concret-de-bout-en-bout)
 6. [Projets multi-fichiers — Comment ca marche](#6-projets-multi-fichiers--comment-ca-marche)
-7. [Resume](#7-resume)
+7. [Pipeline Central — Ne pas toucher aux repos SAS existants](#7-pipeline-central--ne-pas-toucher-aux-repos-sas-existants)
+8. [Resume](#8-resume)
 
 ---
 
@@ -905,7 +906,169 @@ de projet SAS. L'outil scanne tout, resout les %INCLUDE, et genere.
 
 ---
 
-## 7. Resume
+## 7. Pipeline Central — Ne pas toucher aux repos SAS existants
+
+### Le probleme
+
+Tes projets SAS ont **deja leur propre CI/CD**. Tu ne veux pas
+modifier leur `.gitlab-ci.yml` existant pour ajouter la generation
+de datasets de test.
+
+### La solution : un repo central dedie
+
+On cree un **repo separe** dont le seul role est de generer les
+datasets pour tous tes projets SAS. Ce repo ne contient que 3 fichiers :
+
+```
+sas-test-data-pipeline/            ← nouveau repo GitLab
+├── .gitlab-ci.yml                 ← pipeline de generation
+├── projects.yml                   ← liste de tes projets SAS
+└── scripts/
+    └── generate.sh                ← script d'orchestration
+```
+
+**Tes repos SAS ne sont PAS modifies.** Ce repo les clone en lecture
+seule, genere les datasets, et les publie en artifacts.
+
+### Comment ca marche
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Repo central (sas-test-data-pipeline)                       │
+│                                                              │
+│  projects.yml ──→ Liste tes projets SAS avec leurs URLs      │
+│       │                                                      │
+│       ▼                                                      │
+│  Pipeline CI/CD :                                            │
+│       │                                                      │
+│       ├─ 1. pip install sas-datagen (installe l'outil)       │
+│       ├─ 2. git clone projet-sas-1 (lecture seule)           │
+│       ├─ 3. sas-datagen run --project-dir projet-sas-1/      │
+│       ├─ 4. git clone projet-sas-2 (lecture seule)           │
+│       ├─ 5. sas-datagen run --project-dir projet-sas-2/      │
+│       └─ ...                                                 │
+│                                                              │
+│  output/                                                     │
+│    ├── scoring-client/     ← datasets projet 1               │
+│    ├── reporting-mensuel/  ← datasets projet 2               │
+│    └── ...                 ← telechargeables via artifacts    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Configuration de projects.yml
+
+C'est le fichier cle : il liste tous tes projets SAS a traiter.
+
+```yaml
+projects:
+  - name: scoring-client
+    repo: https://gitlab.example.com/sas-projects/scoring-client.git
+    branch: main
+    entry: programmes/main.sas
+    include_paths:
+      - macros/
+      - includes/
+    macro_vars:
+      ENV: RECETTE
+      ROOT: .
+    rows: 50
+    enabled: true
+
+  - name: reporting-mensuel
+    repo: https://gitlab.example.com/sas-projects/reporting-mensuel.git
+    branch: develop
+    entry: src/main_report.sas
+    include_paths:
+      - src/macros/
+    rows: 40
+    enabled: true
+
+  - name: ancien-projet
+    repo: https://gitlab.example.com/sas-projects/ancien-projet.git
+    enabled: false    # ← desactive, ne sera pas traite
+```
+
+| Champ           | Description                              | Obligatoire |
+|-----------------|------------------------------------------|-------------|
+| `name`          | Nom unique du projet                     | oui         |
+| `repo`          | URL du repo GitLab (HTTPS ou SSH)        | oui         |
+| `branch`        | Branche a cloner                         | non (main)  |
+| `entry`         | Fichier SAS principal                    | non (auto)  |
+| `include_paths` | Repertoires pour resoudre les %INCLUDE   | non         |
+| `macro_vars`    | Variables macro SAS (&VAR.)              | non         |
+| `rows`          | Nombre de lignes a generer               | non (30)    |
+| `enabled`       | Activer/desactiver le projet             | non (true)  |
+
+### Declenchement du pipeline
+
+3 facons de lancer la generation :
+
+| Mode            | Comment                                           | Quand utiliser                    |
+|-----------------|---------------------------------------------------|-----------------------------------|
+| **Manuel**      | GitLab > CI/CD > Pipelines > Run pipeline         | A la demande                      |
+| **Planifie**    | GitLab > CI/CD > Schedules > New schedule         | Tous les lundis a 8h par exemple  |
+| **Sur push**    | Automatique quand tu modifies projects.yml        | Quand tu ajoutes un nouveau projet|
+
+### Un seul projet en debug
+
+Pour traiter un seul projet (utile pour debugger) :
+
+```bash
+# En local
+./scripts/generate.sh --project scoring-client --dry-run --verbose
+
+# En CI — job "run-single-project" avec variable PROJECT_NAME
+# GitLab > CI/CD > Run pipeline > Variables > PROJECT_NAME = scoring-client
+```
+
+### Variables CI/CD a configurer
+
+Dans **Settings > CI/CD > Variables** du repo central :
+
+| Variable         | Description                                    | Type     |
+|------------------|------------------------------------------------|----------|
+| `GITLAB_TOKEN`   | Token avec acces `read_repository` aux repos SAS | Secret  |
+| `SAS_EXECUTABLE` | Chemin vers SAS (si pas sur PATH)               | Variable |
+
+Le `GITLAB_TOKEN` permet au pipeline de cloner tes repos SAS prives.
+Creer un Project Access Token ou Personal Access Token avec le scope
+`read_repository`.
+
+### Recuperer les datasets generes
+
+Les datasets sont publies en **artifacts GitLab** :
+
+1. Aller dans **CI/CD > Pipelines** du repo central
+2. Cliquer sur le pipeline termine
+3. Job `generate-datasets` > **Download artifacts**
+4. Les CSV sont dans `output/<nom-projet>/`
+
+Ou via l'API GitLab :
+
+```bash
+curl --header "PRIVATE-TOKEN: $TOKEN" \
+  "https://gitlab.example.com/api/v4/projects/$PROJECT_ID/jobs/artifacts/main/download?job=generate-datasets" \
+  --output artifacts.zip
+```
+
+### Les fichiers du pipeline central
+
+Les fichiers complets sont dans `ci/central-pipeline/` :
+
+| Fichier                     | Role                                          |
+|-----------------------------|-----------------------------------------------|
+| `.gitlab-ci.yml`            | Pipeline GitLab avec 4 stages                 |
+| `projects.yml`              | Configuration de tous les projets SAS         |
+| `scripts/generate.sh`       | Script qui clone + genere pour chaque projet  |
+| `README.md`                 | Guide de mise en place                        |
+
+Pour mettre en place le repo central, il suffit de copier ces 4
+fichiers dans un nouveau repo GitLab et d'adapter `projects.yml`
+avec les URLs de tes vrais projets SAS.
+
+---
+
+## 8. Resume
 
 Le projet resout ce probleme :
 
