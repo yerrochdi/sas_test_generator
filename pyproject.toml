@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sas-data-generator"
+version = "0.1.0"
+description = "Generate test datasets to maximize SAS code coverage"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "SAS Data Generator Team" }]
+dependencies = [
+    "pandas>=2.0",
+    "typer>=0.9",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "hypothesis>=6.0",
+    "ruff>=0.1",
+]
+sas7bdat = [
+    "pyreadstat>=1.2",
+]
+
+[project.scripts]
+sas-datagen = "sas_data_generator.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

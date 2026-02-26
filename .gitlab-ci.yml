@@ -1,0 +1,212 @@
+# =============================================================================
+# GitLab CI/CD — SAS Data Generator
+#
+# Stages:
+#   1. lint      — code quality checks
+#   2. test      — unit tests (no SAS required)
+#   3. generate  — parse SAS programs and generate test datasets
+#   4. coverage  — run SAS with instrumented code and measure coverage
+#   5. report    — publish artifacts and coverage reports
+#
+# Requirements:
+#   - Python 3.10+ available in runner
+#   - SAS 9.4+ available in runner (for coverage stage only)
+#   - SAS_EXECUTABLE env var set if sas is not on PATH
+# =============================================================================
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # Set this in CI/CD settings if SAS is not on PATH:
+  # SAS_EXECUTABLE: "/usr/local/SASHome/SASFoundation/9.4/sas"
+
+stages:
+  - lint
+  - test
+  - generate
+  - coverage
+  - report
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+.python-setup: &python-setup
+  image: python:3.11-slim
+  before_script:
+    - pip install --upgrade pip
+    - pip install -e ".[dev]"
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .pip-cache/
+
+# ---------------------------------------------------------------------------
+# Stage: lint
+# ---------------------------------------------------------------------------
+
+lint:
+  <<: *python-setup
+  stage: lint
+  script:
+    - pip install ruff
+    - ruff check src/ tests/
+    - ruff format --check src/ tests/
+  allow_failure: true
+
+# ---------------------------------------------------------------------------
+# Stage: test (unit tests — no SAS required)
+# ---------------------------------------------------------------------------
+
+unit-tests:
+  <<: *python-setup
+  stage: test
+  script:
+    - pytest tests/ -v --tb=short --junitxml=report.xml --cov=sas_data_generator --cov-report=xml:coverage.xml --cov-report=html:htmlcov/
+  artifacts:
+    when: always
+    paths:
+      - report.xml
+      - coverage.xml
+      - htmlcov/
+    reports:
+      junit: report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+  coverage: '/TOTAL\s+\d+\s+\d+\s+(\d+%)/'
+
+# ---------------------------------------------------------------------------
+# Stage: generate (parse SAS + generate test datasets)
+# ---------------------------------------------------------------------------
+
+generate-datasets:
+  <<: *python-setup
+  stage: generate
+  script:
+    # Analyze SAS programs
+    - |
+      echo "=== Analyzing SAS programs ==="
+      find sas_programs/ -name "*.sas" -print0 | xargs -0 sas-datagen analyze || true
+
+    # Generate test datasets (no SAS execution needed)
+    - |
+      echo "=== Generating seed datasets ==="
+      sas-datagen generate sas_programs/*.sas \
+        --output output/datasets \
+        --rows 30 \
+        --seed 42 \
+        --format csv \
+        --verbose
+  artifacts:
+    paths:
+      - output/datasets/
+    expire_in: 1 week
+  rules:
+    - exists:
+        - sas_programs/*.sas
+
+# ---------------------------------------------------------------------------
+# Stage: coverage (run SAS + measure coverage)
+# ---------------------------------------------------------------------------
+
+sas-coverage:
+  stage: coverage
+  # Use a runner with SAS installed
+  tags:
+    - sas
+  image: ${SAS_DOCKER_IMAGE:-python:3.11-slim}
+  before_script:
+    - pip install --upgrade pip
+    - pip install -e ".[dev]"
+  script:
+    - |
+      echo "=== Running SAS coverage loop ==="
+      sas-datagen run sas_programs/*.sas \
+        --output output/coverage \
+        --rows 30 \
+        --seed 42 \
+        --max-iter 5 \
+        --target 90 \
+        --format csv \
+        --verbose \
+        ${SAS_EXECUTABLE:+--sas "$SAS_EXECUTABLE"} \
+        ${MACRO_VARS_FILE:+--macros "$MACRO_VARS_FILE"} \
+        ${LIBNAME_FILE:+--libnames "$LIBNAME_FILE"}
+  artifacts:
+    when: always
+    paths:
+      - output/coverage/
+      - output/coverage/**/*.csv
+      - output/coverage/**/*.json
+      - output/coverage/**/*.txt
+      - output/coverage/**/*.sas
+      - output/coverage/**/*.log
+    expire_in: 1 month
+  rules:
+    - exists:
+        - sas_programs/*.sas
+      when: manual
+  allow_failure: true
+  needs:
+    - generate-datasets
+
+# Dry-run variant (no SAS required, for testing pipeline)
+sas-coverage-dry:
+  <<: *python-setup
+  stage: coverage
+  script:
+    - |
+      echo "=== Dry-run coverage (no SAS) ==="
+      sas-datagen run sas_programs/*.sas \
+        --output output/coverage-dry \
+        --rows 20 \
+        --seed 42 \
+        --max-iter 3 \
+        --dry-run \
+        --verbose
+  artifacts:
+    when: always
+    paths:
+      - output/coverage-dry/
+    expire_in: 1 week
+  rules:
+    - exists:
+        - sas_programs/*.sas
+
+# ---------------------------------------------------------------------------
+# Stage: report (aggregate and publish)
+# ---------------------------------------------------------------------------
+
+coverage-report:
+  <<: *python-setup
+  stage: report
+  script:
+    - |
+      echo "=== Coverage Summary ==="
+      for f in output/coverage/*_coverage_report.txt; do
+        if [ -f "$f" ]; then
+          echo "--- $(basename "$f") ---"
+          cat "$f"
+          echo ""
+        fi
+      done
+
+      echo "=== JSON Reports ==="
+      for f in output/coverage/*_coverage_report.json; do
+        if [ -f "$f" ]; then
+          echo "--- $(basename "$f") ---"
+          python -m json.tool "$f"
+          echo ""
+        fi
+      done
+  artifacts:
+    when: always
+    paths:
+      - output/
+    expire_in: 1 month
+  needs:
+    - job: sas-coverage
+      optional: true
+    - job: sas-coverage-dry
+      optional: true

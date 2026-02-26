@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pip-cache/
+htmlcov/
+.coverage
+coverage.xml
+report.xml
+output/
+.ruff_cache/
+*.sas7bdat
+.DS_Store
