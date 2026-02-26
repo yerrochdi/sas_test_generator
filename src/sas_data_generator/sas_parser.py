@@ -535,6 +535,93 @@ def parse_sas_file(file_path: str | Path) -> ParseResult:
     return result
 
 
+def parse_sas_project(
+    entry_file: str | Path,
+    search_dirs: list[str | Path] | None = None,
+    macro_vars: dict[str, str] | None = None,
+) -> ParseResult:
+    """Parse a SAS project by resolving %INCLUDE directives first.
+
+    This is the recommended way to parse multi-file SAS projects.
+    It inlines all %INCLUDE'd files, then parses the combined source.
+
+    Args:
+        entry_file: The main SAS program (e.g., main.sas).
+        search_dirs: Additional directories to search for included files.
+        macro_vars: Macro variable definitions for expanding paths in %INCLUDE.
+
+    Returns:
+        ParseResult for the entire resolved project.
+    """
+    from .include_resolver import resolve_includes
+
+    entry_file = Path(entry_file)
+    logger.info("Parsing SAS project from entry: %s", entry_file)
+
+    resolved = resolve_includes(
+        entry_file,
+        search_dirs=search_dirs,
+        macro_vars=macro_vars,
+    )
+
+    if resolved.errors:
+        for err in resolved.errors:
+            logger.warning("Include resolution: %s", err)
+
+    # Parse the resolved (fully inlined) code
+    code = _strip_comments(resolved.resolved_code)
+    file_id = entry_file.stem[:20]
+    point_counter = [0]
+
+    result = ParseResult(file_path=str(entry_file))
+    result.errors.extend(resolved.errors)
+
+    # Parse DATA steps
+    for match in _DATA_STEP_RE.finditer(code):
+        try:
+            block = _parse_data_step(match, code, point_counter, file_id)
+            result.blocks.append(block)
+        except Exception as exc:
+            line = _line_number_at(code, match.start())
+            result.errors.append(f"Error parsing DATA step at line {line}: {exc}")
+
+    # Parse PROC SQL
+    for match in _PROC_SQL_RE.finditer(code):
+        try:
+            block = _parse_proc_sql(match, code, point_counter, file_id)
+            result.blocks.append(block)
+        except Exception as exc:
+            line = _line_number_at(code, match.start())
+            result.errors.append(f"Error parsing PROC SQL at line {line}: {exc}")
+
+    # Collect all points and variables
+    for block in result.blocks:
+        result.all_coverage_points.extend(block.coverage_points)
+        result.all_variables.extend(block.variables)
+
+    # Deduplicate variables
+    seen_vars: dict[str, VariableRef] = {}
+    for var in result.all_variables:
+        key = var.name.lower()
+        if key not in seen_vars or (
+            seen_vars[key].inferred_type == "unknown"
+            and var.inferred_type != "unknown"
+        ):
+            seen_vars[key] = var
+    result.all_variables = list(seen_vars.values())
+
+    logger.info(
+        "Parsed project %s: %d files included, %d blocks, %d coverage points, %d variables",
+        entry_file.name,
+        len(resolved.included_files),
+        len(result.blocks),
+        len(result.all_coverage_points),
+        len(result.all_variables),
+    )
+
+    return result
+
+
 def parse_sas_code(code: str, file_id: str = "inline") -> ParseResult:
     """Parse SAS code from a string (useful for testing)."""
     from tempfile import NamedTemporaryFile

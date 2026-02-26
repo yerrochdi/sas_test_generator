@@ -1,10 +1,19 @@
 """CLI interface for sas-data-generator.
 
 Usage:
-    sas-datagen analyze  program.sas           # Parse and show coverage points
-    sas-datagen generate program.sas -o out/   # Generate test datasets
-    sas-datagen run      program.sas -o out/   # Full loop: generate + run SAS + report
-    sas-datagen instrument program.sas         # Show instrumented code (debug)
+    # Single file
+    sas-datagen analyze  program.sas
+    sas-datagen generate program.sas -o out/
+    sas-datagen run      program.sas -o out/
+    sas-datagen instrument program.sas
+
+    # Multi-file project with %INCLUDE resolution
+    sas-datagen analyze  --project-dir /projets/sas/projet_A/ --entry main.sas
+    sas-datagen generate --project-dir /projets/sas/projet_A/ --entry main.sas -o out/
+    sas-datagen run      --project-dir /projets/sas/projet_A/ --entry main.sas -o out/
+
+    # With extra include search paths
+    sas-datagen run main.sas --include-path ./macros --include-path ./includes
 """
 
 from __future__ import annotations
@@ -13,6 +22,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
@@ -37,6 +47,95 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _resolve_sas_files(
+    sas_files: list[Path] | None,
+    project_dir: str | None,
+    entry_file: str | None,
+    include_paths: list[str] | None,
+    macro_vars: dict[str, str] | None = None,
+) -> tuple[list[Path], bool]:
+    """Resolve which SAS files to process.
+
+    Returns:
+        (list_of_files, use_project_mode)
+        - If project_dir is set: returns files from project scanning
+        - Otherwise: returns the explicit file list
+    """
+    if project_dir:
+        from .include_resolver import scan_project_directory
+        files = scan_project_directory(project_dir, entry_file=entry_file)
+        if not files:
+            console.print(f"[red]No .sas files found in {project_dir}[/red]")
+        return files, True
+    elif sas_files:
+        return sas_files, False
+    else:
+        console.print("[red]Provide SAS files or --project-dir[/red]")
+        return [], False
+
+
+def _parse_file_or_project(
+    sas_file: Path,
+    include_paths: list[str] | None,
+    macro_vars: dict[str, str] | None,
+    use_project_mode: bool,
+):
+    """Parse a SAS file, with or without include resolution."""
+    from .sas_parser import parse_sas_file, parse_sas_project
+
+    if use_project_mode or include_paths:
+        return parse_sas_project(
+            sas_file,
+            search_dirs=include_paths,
+            macro_vars=macro_vars,
+        )
+    else:
+        return parse_sas_file(sas_file)
+
+
+def _display_parse_result(result, file_label: str) -> None:
+    """Display parse results in a formatted table."""
+    console.print(f"\n[bold]File: {file_label}[/bold]")
+    console.print(f"  Blocks: {len(result.blocks)}")
+    console.print(f"  Coverage points: {len(result.all_coverage_points)}")
+    console.print(f"  Variables: {len(result.all_variables)}")
+
+    if result.errors:
+        console.print(f"  [yellow]Warnings: {len(result.errors)}[/yellow]")
+        for err in result.errors:
+            console.print(f"    {err}")
+
+    if result.all_coverage_points:
+        table = Table(title="Coverage Points")
+        table.add_column("ID", style="cyan")
+        table.add_column("Type", style="green")
+        table.add_column("Line")
+        table.add_column("Description")
+        table.add_column("Condition", max_width=50)
+
+        for cp in result.all_coverage_points:
+            table.add_row(
+                cp.point_id,
+                cp.point_type.name,
+                str(cp.line_number),
+                cp.description,
+                cp.condition[:50] if cp.condition else "",
+            )
+        console.print(table)
+
+    if result.all_variables:
+        vtable = Table(title="Detected Variables")
+        vtable.add_column("Name", style="cyan")
+        vtable.add_column("Type", style="green")
+        vtable.add_column("Source")
+        vtable.add_column("Line")
+        vtable.add_column("Format")
+
+        for v in result.all_variables:
+            vtable.add_row(v.name, v.inferred_type, v.source, str(v.line_number), v.format)
+        console.print(vtable)
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(False, "--version", "-V", help="Show version"),
@@ -48,70 +147,75 @@ def main(
 
 @app.command()
 def analyze(
-    sas_files: list[Path] = typer.Argument(..., help="SAS program files to analyze"),
+    sas_files: Optional[list[Path]] = typer.Argument(None, help="SAS program files to analyze"),
+    project_dir: Optional[str] = typer.Option(
+        None, "--project-dir", "-p",
+        help="SAS project directory (scans all .sas files, resolves %INCLUDE)",
+    ),
+    entry_file: Optional[str] = typer.Option(
+        None, "--entry", "-e",
+        help="Entry-point file name within --project-dir (e.g., main.sas)",
+    ),
+    include_paths: Optional[list[str]] = typer.Option(
+        None, "--include-path", "-I",
+        help="Additional directories to search for %%INCLUDE files",
+    ),
+    macro_vars_json: Optional[str] = typer.Option(
+        None, "--macros",
+        help="JSON file with macro variables (used for resolving %%INCLUDE paths)",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Parse SAS files and display coverage points and variables."""
+    """Parse SAS files and display coverage points and variables.
+
+    Supports two modes:
+    - File mode: pass one or more .sas files directly
+    - Project mode: pass --project-dir to scan a directory and resolve %INCLUDE
+    """
     _setup_logging(verbose)
-    from .sas_parser import parse_sas_file
 
-    for sas_file in sas_files:
-        if not sas_file.exists():
-            console.print(f"[red]File not found: {sas_file}[/red]")
-            continue
+    macro_vars = None
+    if macro_vars_json:
+        macro_vars = json.loads(Path(macro_vars_json).read_text())
 
-        result = parse_sas_file(sas_file)
+    files, use_project = _resolve_sas_files(sas_files, project_dir, entry_file, include_paths, macro_vars)
 
-        console.print(f"\n[bold]File: {sas_file}[/bold]")
-        console.print(f"  Blocks: {len(result.blocks)}")
-        console.print(f"  Coverage points: {len(result.all_coverage_points)}")
-        console.print(f"  Variables: {len(result.all_variables)}")
+    if not files:
+        raise typer.Exit(1)
 
-        if result.errors:
-            console.print(f"  [yellow]Warnings: {len(result.errors)}[/yellow]")
-            for err in result.errors:
-                console.print(f"    {err}")
-
-        # Coverage points table
-        if result.all_coverage_points:
-            table = Table(title="Coverage Points")
-            table.add_column("ID", style="cyan")
-            table.add_column("Type", style="green")
-            table.add_column("Line")
-            table.add_column("Description")
-            table.add_column("Condition", max_width=50)
-
-            for cp in result.all_coverage_points:
-                table.add_row(
-                    cp.point_id,
-                    cp.point_type.name,
-                    str(cp.line_number),
-                    cp.description,
-                    cp.condition[:50] if cp.condition else "",
-                )
-            console.print(table)
-
-        # Variables table
-        if result.all_variables:
-            vtable = Table(title="Detected Variables")
-            vtable.add_column("Name", style="cyan")
-            vtable.add_column("Type", style="green")
-            vtable.add_column("Source")
-            vtable.add_column("Line")
-            vtable.add_column("Format")
-
-            for v in result.all_variables:
-                vtable.add_row(v.name, v.inferred_type, v.source, str(v.line_number), v.format)
-            console.print(vtable)
+    if use_project and entry_file:
+        # In project mode with an entry file: parse the whole project as one unit
+        entry = files[0]
+        result = _parse_file_or_project(entry, include_paths, macro_vars, use_project)
+        _display_parse_result(result, f"{entry} (project mode, {len(files)} files scanned)")
+    else:
+        # File-by-file mode
+        for sas_file in files:
+            if not sas_file.exists():
+                console.print(f"[red]File not found: {sas_file}[/red]")
+                continue
+            result = _parse_file_or_project(sas_file, include_paths, macro_vars, use_project)
+            _display_parse_result(result, str(sas_file))
 
 
 @app.command()
 def instrument(
     sas_file: Path = typer.Argument(..., help="SAS program to instrument"),
-    output: Path = typer.Option(None, "--output", "-o", help="Output file (stdout if omitted)"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file (stdout if omitted)"),
+    include_paths: Optional[list[str]] = typer.Option(
+        None, "--include-path", "-I",
+        help="Additional directories to search for %%INCLUDE files",
+    ),
+    macro_vars_json: Optional[str] = typer.Option(
+        None, "--macros",
+        help="JSON file with macro variables",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Instrument a SAS file and show/write the result."""
+    """Instrument a SAS file and show/write the result.
+
+    With --include-path, resolves %INCLUDE before instrumenting.
+    """
     _setup_logging(verbose)
     from .sas_instrumenter import instrument_sas_file
 
@@ -119,7 +223,27 @@ def instrument(
         console.print(f"[red]File not found: {sas_file}[/red]")
         raise typer.Exit(1)
 
-    result = instrument_sas_file(sas_file)
+    macro_vars = None
+    if macro_vars_json:
+        macro_vars = json.loads(Path(macro_vars_json).read_text())
+
+    # If include paths are provided, resolve includes first and write a temp file
+    if include_paths:
+        from .include_resolver import resolve_includes
+        resolved = resolve_includes(sas_file, search_dirs=include_paths, macro_vars=macro_vars)
+        if resolved.errors:
+            for err in resolved.errors:
+                console.print(f"  [yellow]{err}[/yellow]")
+
+        # Write resolved code to temp file for instrumentation
+        from tempfile import NamedTemporaryFile
+        with NamedTemporaryFile(mode="w", suffix=".sas", delete=False, encoding="utf-8") as f:
+            f.write(resolved.resolved_code)
+            f.flush()
+            result = instrument_sas_file(f.name)
+        console.print(f"  Resolved {len(resolved.included_files)} included files")
+    else:
+        result = instrument_sas_file(sas_file)
 
     if output:
         output.write_text(result.instrumented_code, encoding="utf-8")
@@ -132,55 +256,116 @@ def instrument(
 
 @app.command()
 def generate(
-    sas_files: list[Path] = typer.Argument(..., help="SAS program files"),
+    sas_files: Optional[list[Path]] = typer.Argument(None, help="SAS program files"),
+    project_dir: Optional[str] = typer.Option(
+        None, "--project-dir", "-p",
+        help="SAS project directory",
+    ),
+    entry_file: Optional[str] = typer.Option(
+        None, "--entry", "-e",
+        help="Entry-point file within --project-dir",
+    ),
+    include_paths: Optional[list[str]] = typer.Option(
+        None, "--include-path", "-I",
+        help="Additional directories to search for %%INCLUDE files",
+    ),
     output_dir: Path = typer.Option("./output", "--output", "-o", help="Output directory"),
     num_rows: int = typer.Option(20, "--rows", "-n", help="Number of rows per dataset"),
     seed: int = typer.Option(42, "--seed", "-s", help="Random seed for reproducibility"),
     formats: list[str] = typer.Option(["csv"], "--format", "-f", help="Output formats"),
+    macro_vars_json: Optional[str] = typer.Option(
+        None, "--macros",
+        help="JSON file with macro variables",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Generate test datasets from SAS program analysis (no SAS execution)."""
+    """Generate test datasets from SAS program analysis (no SAS execution).
+
+    Supports --project-dir to analyze a whole SAS project at once.
+    """
     _setup_logging(verbose)
-    from .sas_parser import parse_sas_file
     from .dataset_generator import generate_seed_datasets, export_dataset
+
+    macro_vars = None
+    if macro_vars_json:
+        macro_vars = json.loads(Path(macro_vars_json).read_text())
+
+    files, use_project = _resolve_sas_files(sas_files, project_dir, entry_file, include_paths, macro_vars)
+
+    if not files:
+        raise typer.Exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for sas_file in sas_files:
-        if not sas_file.exists():
-            console.print(f"[red]File not found: {sas_file}[/red]")
-            continue
+    # In project mode with entry: parse everything as one unit
+    if use_project and entry_file:
+        entry = files[0]
+        parse_result = _parse_file_or_project(entry, include_paths, macro_vars, use_project)
+        console.print(f"\n[bold]Project: {entry} ({len(files)} files)[/bold]")
+        console.print(f"  Blocks: {len(parse_result.blocks)}, "
+                      f"Coverage points: {len(parse_result.all_coverage_points)}")
 
-        parse_result = parse_sas_file(sas_file)
         datasets = generate_seed_datasets(parse_result, num_rows=num_rows, seed=seed)
-
         for ds in datasets:
             paths = export_dataset(ds, output_dir, formats=formats)
             console.print(f"  Generated: {ds.name} -> {paths}")
             for note in ds.generation_notes:
                 console.print(f"    {note}")
+    else:
+        for sas_file in files:
+            if not sas_file.exists():
+                console.print(f"[red]File not found: {sas_file}[/red]")
+                continue
+
+            parse_result = _parse_file_or_project(sas_file, include_paths, macro_vars, use_project)
+            datasets = generate_seed_datasets(parse_result, num_rows=num_rows, seed=seed)
+
+            for ds in datasets:
+                paths = export_dataset(ds, output_dir, formats=formats)
+                console.print(f"  Generated: {ds.name} -> {paths}")
+                for note in ds.generation_notes:
+                    console.print(f"    {note}")
 
 
 @app.command()
 def run(
-    sas_files: list[Path] = typer.Argument(..., help="SAS program files"),
+    sas_files: Optional[list[Path]] = typer.Argument(None, help="SAS program files"),
+    project_dir: Optional[str] = typer.Option(
+        None, "--project-dir", "-p",
+        help="SAS project directory (resolves all %INCLUDE automatically)",
+    ),
+    entry_file: Optional[str] = typer.Option(
+        None, "--entry", "-e",
+        help="Entry-point file within --project-dir (e.g., main.sas)",
+    ),
+    include_paths: Optional[list[str]] = typer.Option(
+        None, "--include-path", "-I",
+        help="Additional directories to search for %%INCLUDE files",
+    ),
     output_dir: Path = typer.Option("./output", "--output", "-o", help="Output directory"),
     num_rows: int = typer.Option(20, "--rows", "-n", help="Number of rows per seed dataset"),
     seed: int = typer.Option(42, "--seed", "-s", help="Random seed"),
     max_iterations: int = typer.Option(5, "--max-iter", "-i", help="Max mutation iterations"),
     coverage_target: float = typer.Option(100.0, "--target", "-t", help="Target coverage %%"),
-    sas_executable: str = typer.Option(None, "--sas", help="Path to SAS executable"),
+    sas_executable: Optional[str] = typer.Option(None, "--sas", help="Path to SAS executable"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Skip SAS execution"),
     timeout: int = typer.Option(300, "--timeout", help="SAS execution timeout (seconds)"),
     formats: list[str] = typer.Option(["csv"], "--format", "-f", help="Output formats"),
-    macro_vars_json: str = typer.Option(None, "--macros", help="JSON file with macro variables"),
-    libname_json: str = typer.Option(None, "--libnames", help="JSON file with libname mappings"),
+    macro_vars_json: Optional[str] = typer.Option(None, "--macros", help="JSON file with macro variables"),
+    libname_json: Optional[str] = typer.Option(None, "--libnames", help="JSON file with libname mappings"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Full loop: generate datasets, run SAS, measure coverage, mutate, repeat."""
+    """Full loop: generate datasets, run SAS, measure coverage, mutate, repeat.
+
+    Two modes:
+    - File mode: sas-datagen run prog1.sas prog2.sas
+    - Project mode: sas-datagen run --project-dir /path/to/project --entry main.sas
+
+    Project mode resolves all %INCLUDE directives automatically.
+    """
     _setup_logging(verbose)
-    from .sas_parser import parse_sas_file
-    from .sas_instrumenter import instrument_sas_file
+    from .sas_parser import parse_sas_file, parse_sas_project
+    from .sas_instrumenter import instrument_sas_file, instrument_sas_code
     from .sas_runner import run_sas, run_sas_dry
     from .dataset_generator import (
         generate_seed_datasets,
@@ -206,19 +391,33 @@ def run(
     if libname_json:
         libname_map = json.loads(Path(libname_json).read_text())
 
+    files, use_project = _resolve_sas_files(sas_files, project_dir, entry_file, include_paths, macro_vars)
+    if not files:
+        raise typer.Exit(1)
+
     all_reports: list[CoverageReport] = []
 
-    for sas_file in sas_files:
+    # In project mode with entry: treat the whole project as a single unit
+    if use_project and entry_file:
+        files_to_process = [files[0]]  # Only the resolved entry
+    else:
+        files_to_process = files
+
+    for sas_file in files_to_process:
         if not sas_file.exists():
             console.print(f"[red]File not found: {sas_file}[/red]")
             continue
 
         console.print(f"\n[bold]=== Processing: {sas_file} ===[/bold]")
 
-        # Phase 1: Parse
-        parse_result = parse_sas_file(sas_file)
+        # Phase 1: Parse (with or without include resolution)
+        parse_result = _parse_file_or_project(sas_file, include_paths, macro_vars, use_project)
         console.print(f"  Parsed: {len(parse_result.blocks)} blocks, "
                       f"{len(parse_result.all_coverage_points)} coverage points")
+
+        if parse_result.errors:
+            for err in parse_result.errors:
+                console.print(f"  [yellow]{err}[/yellow]")
 
         if not parse_result.all_coverage_points:
             console.print("  [yellow]No coverage points found — skipping[/yellow]")
@@ -226,7 +425,16 @@ def run(
 
         # Phase 2: Instrument
         coverage_csv = str(output_dir / f"{sas_file.stem}_coverage.csv")
-        instr_result = instrument_sas_file(sas_file, coverage_csv_path=coverage_csv)
+        if use_project or include_paths:
+            # Resolve includes first, then instrument the resolved code
+            from .include_resolver import resolve_includes
+            resolved = resolve_includes(sas_file, search_dirs=include_paths, macro_vars=macro_vars)
+            instr_result = instrument_sas_code(
+                resolved.resolved_code,
+                coverage_csv_path=coverage_csv,
+            )
+        else:
+            instr_result = instrument_sas_file(sas_file, coverage_csv_path=coverage_csv)
 
         # Save instrumented code for debugging
         instr_path = output_dir / f"{sas_file.stem}_instrumented.sas"

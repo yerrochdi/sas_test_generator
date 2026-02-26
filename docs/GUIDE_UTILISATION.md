@@ -10,29 +10,22 @@
    - 4.2 [instrument — Voir le code instrumente](#42-instrument--voir-le-code-instrumente)
    - 4.3 [generate — Generer des datasets de test](#43-generate--generer-des-datasets-de-test)
    - 4.4 [run — Boucle complete avec execution SAS](#44-run--boucle-complete-avec-execution-sas)
-5. [Fichiers de configuration](#5-fichiers-de-configuration)
+5. [Projets multi-fichiers et %INCLUDE](#5-projets-multi-fichiers-et-include)
+   - 5.1 [Mode projet (--project-dir)](#51-mode-projet---project-dir)
+   - 5.2 [Chemins d'inclusion (--include-path)](#52-chemins-dinclusion---include-path)
+   - 5.3 [Comment fonctionne la resolution](#53-comment-fonctionne-la-resolution)
+   - 5.4 [Exemples concrets multi-fichiers](#54-exemples-concrets-multi-fichiers)
+6. [Fichiers de configuration](#6-fichiers-de-configuration)
    - 5.1 [Variables macro (--macros)](#51-variables-macro---macros)
    - 5.2 [Mapping libname (--libnames)](#52-mapping-libname---libnames)
-6. [Configuration de l'executable SAS](#6-configuration-de-lexecutable-sas)
-7. [Comprendre les sorties](#7-comprendre-les-sorties)
-   - 7.1 [Arborescence de sortie](#71-arborescence-de-sortie)
-   - 7.2 [Rapport de couverture JSON](#72-rapport-de-couverture-json)
-   - 7.3 [Rapport de couverture texte](#73-rapport-de-couverture-texte)
-   - 7.4 [Code instrumente](#74-code-instrumente)
-8. [Integration GitLab CI/CD](#8-integration-gitlab-cicd)
-   - 8.1 [Organisation du repo GitLab](#81-organisation-du-repo-gitlab)
-   - 8.2 [Variables CI/CD a configurer](#82-variables-cicd-a-configurer)
-   - 8.3 [Stages du pipeline](#83-stages-du-pipeline)
-   - 8.4 [Personnalisation du pipeline](#84-personnalisation-du-pipeline)
-9. [Scenarios d'utilisation](#9-scenarios-dutilisation)
-   - 9.1 [Utilisation locale sans SAS](#91-utilisation-locale-sans-sas)
-   - 9.2 [Utilisation locale avec SAS](#92-utilisation-locale-avec-sas)
-   - 9.3 [Utilisation en CI avec SAS](#93-utilisation-en-ci-avec-sas)
-   - 9.4 [Traiter plusieurs programmes SAS](#94-traiter-plusieurs-programmes-sas)
-10. [Points de couverture](#10-points-de-couverture)
-11. [Tuning et optimisation](#11-tuning-et-optimisation)
-12. [Depannage](#12-depannage)
-13. [Limitations connues](#13-limitations-connues)
+7. [Configuration de l'executable SAS](#7-configuration-de-lexecutable-sas)
+8. [Comprendre les sorties](#8-comprendre-les-sorties)
+9. [Integration GitLab CI/CD](#9-integration-gitlab-cicd)
+10. [Scenarios d'utilisation](#10-scenarios-dutilisation)
+11. [Points de couverture](#11-points-de-couverture)
+12. [Tuning et optimisation](#12-tuning-et-optimisation)
+13. [Depannage](#13-depannage)
+14. [Limitations connues](#14-limitations-connues)
 
 ---
 
@@ -381,7 +374,182 @@ Utile en CI pour echouer le pipeline si la couverture est insuffisante.
 
 ---
 
-## 5. Fichiers de configuration
+## 5. Projets multi-fichiers et %INCLUDE
+
+La plupart des projets SAS reels utilisent plusieurs fichiers :
+un programme principal qui fait des `%INCLUDE` vers des macros,
+des initialisations, et des etapes de traitement.
+
+L'outil gere ce cas avec deux options : `--project-dir` et `--include-path`.
+
+### 5.1 Mode projet (`--project-dir`)
+
+Quand tu as un repertoire de projet SAS complet :
+
+```
+/projets/sas/projet_A/
+├── main.sas                 <- point d'entree
+├── macros/
+│   ├── macro_risque.sas
+│   └── macro_calcul.sas
+├── includes/
+│   └── init.sas
+└── programmes/
+    ├── etape1.sas
+    └── etape2.sas
+```
+
+Tu pointes vers le repertoire avec `--project-dir` et tu indiques
+le fichier d'entree avec `--entry` :
+
+```bash
+# Analyser tout le projet
+sas-datagen analyze \
+  --project-dir /projets/sas/projet_A/ \
+  --entry main.sas
+
+# Generer les datasets pour tout le projet
+sas-datagen generate \
+  --project-dir /projets/sas/projet_A/ \
+  --entry main.sas \
+  --output output/
+
+# Boucle complete
+sas-datagen run \
+  --project-dir /projets/sas/projet_A/ \
+  --entry main.sas \
+  --output output/ \
+  --dry-run
+```
+
+**Ce qui se passe** :
+1. L'outil scanne le repertoire et trouve tous les `.sas`
+2. Il lit `main.sas` et suit chaque `%INCLUDE`
+3. Il inline le contenu de chaque fichier inclus
+4. Il parse le code complet resolu (comme si tout etait dans un seul fichier)
+5. Il genere les datasets en analysant TOUTES les branches de TOUS les fichiers
+
+**Detection automatique du point d'entree** :
+
+Si tu ne specifies pas `--entry`, l'outil cherche un fichier nomme :
+`main.sas`, `run_all.sas`, `autoexec.sas`, `master.sas`, ou `run.sas`.
+
+### 5.2 Chemins d'inclusion (`--include-path`)
+
+Si tu ne veux pas utiliser le mode projet mais que tes fichiers font
+des `%INCLUDE` vers d'autres repertoires, utilise `--include-path` :
+
+```bash
+# Le fichier main.sas fait %include "macro_risque.sas"
+# mais ce fichier est dans un autre dossier
+sas-datagen analyze main.sas \
+  --include-path /projets/sas/macros \
+  --include-path /projets/sas/includes
+
+# Plusieurs chemins possibles
+sas-datagen run main.sas \
+  --include-path ./macros \
+  --include-path ./includes \
+  --include-path /shared/sas/common_macros \
+  --output output/
+```
+
+**Ordre de recherche des fichiers inclus** :
+
+1. Chemin absolu (si le `%INCLUDE` donne un chemin absolu)
+2. Relatif au fichier qui fait le `%INCLUDE`
+3. Chaque repertoire `--include-path`, dans l'ordre
+4. Sous-repertoires du repertoire parent du fichier d'entree
+
+### 5.3 Comment fonctionne la resolution
+
+Quand l'outil rencontre :
+
+```sas
+%include "macros/macro_risque.sas";
+```
+
+Il :
+1. Cherche le fichier dans les chemins configures
+2. Lit son contenu
+3. Remplace la ligne `%INCLUDE` par le contenu du fichier
+4. Si ce fichier contient lui-meme des `%INCLUDE`, il les resout aussi (recursif)
+5. Detecte et signale les inclusions circulaires
+
+**Patterns supportes** :
+
+```sas
+%include "chemin/fichier.sas";        /* double quotes */
+%include 'chemin/fichier.sas';        /* single quotes */
+%inc "fichier.sas";                   /* forme courte %inc */
+%include "&MACRO_VAR./fichier.sas";   /* variable macro dans le chemin */
+```
+
+**Variables macro dans les chemins** :
+
+Si tes `%INCLUDE` utilisent des variables macro dans les chemins
+(ex: `%include "&ROOT./macros/init.sas"`), fournis-les via `--macros` :
+
+```json
+{
+  "ROOT": "/projets/sas/projet_A"
+}
+```
+
+```bash
+sas-datagen run main.sas \
+  --macros config/macros.json \
+  --include-path /projets/sas/
+```
+
+### 5.4 Exemples concrets multi-fichiers
+
+**Cas 1 : Projet avec macros dans un sous-dossier**
+
+```
+mon_projet/
+├── main.sas           ← %include "macros/calc.sas";
+└── macros/
+    └── calc.sas       ← contient des IF/ELSE
+```
+
+```bash
+# L'outil trouve automatiquement macros/calc.sas (sous-dossier)
+sas-datagen analyze --project-dir mon_projet/ --entry main.sas
+```
+
+**Cas 2 : Macros partagees dans un repertoire commun**
+
+```
+/projets/sas/
+├── commun/            ← macros partagees entre projets
+│   └── utils.sas
+├── projet_A/
+│   └── main.sas      ← %include "/projets/sas/commun/utils.sas";
+└── projet_B/
+    └── main.sas
+```
+
+```bash
+sas-datagen run /projets/sas/projet_A/main.sas \
+  --include-path /projets/sas/commun
+```
+
+**Cas 3 : Plusieurs niveaux d'inclusion**
+
+`main.sas` inclut `init.sas` qui inclut `formats.sas` :
+
+```bash
+# L'outil suit toute la chaine automatiquement
+sas-datagen analyze --project-dir mon_projet/ --entry main.sas -v
+# Les logs montrent chaque fichier resolu :
+#   Resolved: init.sas -> /chemin/includes/init.sas
+#   Resolved: formats.sas -> /chemin/includes/formats.sas
+```
+
+---
+
+## 6. Fichiers de configuration
 
 ### 5.1 Variables macro (`--macros`)
 
@@ -460,7 +628,7 @@ sas-datagen run programme.sas \
 
 ---
 
-## 6. Configuration de l'executable SAS
+## 7. Configuration de l'executable SAS
 
 L'outil cherche l'executable SAS dans cet ordre :
 
@@ -505,7 +673,7 @@ pas encore expose en CLI — prevu pour V1).
 
 ---
 
-## 7. Comprendre les sorties
+## 8. Comprendre les sorties
 
 ### 7.1 Arborescence de sortie
 
@@ -606,7 +774,7 @@ Ces marqueurs ecrivent dans le log SAS des lignes au format
 
 ---
 
-## 8. Integration GitLab CI/CD
+## 9. Integration GitLab CI/CD
 
 ### 8.1 Organisation du repo GitLab
 
@@ -705,7 +873,7 @@ sas-coverage:
 
 ---
 
-## 9. Scenarios d'utilisation
+## 10. Scenarios d'utilisation
 
 ### 9.1 Utilisation locale sans SAS
 
@@ -783,7 +951,7 @@ La couverture globale est calculee et affichee a la fin :
 
 ---
 
-## 10. Points de couverture
+## 11. Points de couverture
 
 L'outil detecte et instrumente les types de branches suivants :
 
@@ -805,7 +973,7 @@ L'outil detecte et instrumente les types de branches suivants :
 
 ---
 
-## 11. Tuning et optimisation
+## 12. Tuning et optimisation
 
 ### Nombre de lignes (`--rows`)
 
@@ -841,7 +1009,7 @@ L'outil detecte et instrumente les types de branches suivants :
 
 ---
 
-## 12. Depannage
+## 13. Depannage
 
 ### "SAS executable not found"
 
@@ -898,7 +1066,7 @@ ou utilisez un fichier de configuration (prevu pour V1).
 
 ---
 
-## 13. Limitations connues
+## 14. Limitations connues
 
 | Limitation                             | Impact                                         | Contournement                           |
 |----------------------------------------|------------------------------------------------|-----------------------------------------|
