@@ -11,9 +11,11 @@
    - 3.4 [sas_runner.py — L'executeur](#34-sas_runnerpy--lexecuteur)
    - 3.5 [coverage.py — L'analyseur de couverture](#35-coveragepy--lanalyseur-de-couverture)
    - 3.6 [cli.py — L'orchestrateur](#36-clipy--lorchestateur)
+   - 3.7 [include_resolver.py — Le resolveur d'includes](#37-include_resolverpy--le-resolveur-dincludes)
 4. [Le pipeline GitLab CI](#4-le-pipeline-gitlab-ci)
 5. [Exemple concret de bout en bout](#5-exemple-concret-de-bout-en-bout)
-6. [Resume](#6-resume)
+6. [Projets multi-fichiers — Comment ca marche](#6-projets-multi-fichiers--comment-ca-marche)
+7. [Resume](#7-resume)
 
 ---
 
@@ -528,6 +530,125 @@ insuffisante.
 
 ---
 
+### 3.7 `include_resolver.py` — Le resolveur d'includes
+
+**Fichier** : `src/sas_data_generator/include_resolver.py`
+
+**Ce qu'il fait** : Avant de parser un projet SAS, il lit le fichier
+d'entree (ex: `main.sas`), suit chaque `%INCLUDE`, et assemble tout
+dans un seul gros bloc de code. Ainsi le parseur voit **tout le code**
+comme si c'etait un seul fichier.
+
+**Le probleme qu'il resout** :
+
+La plupart des projets SAS reels sont organises comme ca :
+
+```
+mon_projet/
+├── main.sas              <- %include "macros/risque.sas";
+│                            %include "programmes/etape1.sas";
+├── macros/
+│   └── risque.sas        <- contient des IF/ELSE
+├── includes/
+│   └── init.sas
+└── programmes/
+    ├── etape1.sas        <- contient des IF/ELSE, SELECT/WHEN
+    └── etape2.sas
+```
+
+Sans le resolveur, le parseur ne verrait que `main.sas` qui ne contient
+que des `%INCLUDE` — aucune branche, aucune variable, rien a tester.
+
+**Comment ca marche en detail** :
+
+```
+Entree : main.sas
+  │
+  ├─ Lit main.sas ligne par ligne
+  │
+  ├─ Ligne: "data a; set b; run;"
+  │  → Garde tel quel
+  │
+  ├─ Ligne: '%include "macros/risque.sas";'
+  │  │
+  │  ├─ Cherche le fichier :
+  │  │   1. Chemin absolu ? Non
+  │  │   2. Relatif a main.sas → mon_projet/macros/risque.sas ? OUI
+  │  │
+  │  ├─ Lit risque.sas
+  │  │   └─ Si risque.sas contient aussi des %INCLUDE → recursion
+  │  │
+  │  └─ Remplace la ligne %INCLUDE par le contenu du fichier :
+  │     /* === BEGIN INCLUDE: risque.sas === */
+  │     ... contenu de risque.sas ...
+  │     /* === END INCLUDE: risque.sas === */
+  │
+  ├─ Ligne: '%include "programmes/etape1.sas";'
+  │  └─ Meme processus...
+  │
+  └─ Sortie : un seul gros code avec tout inline
+
+Ce code resolu est ensuite donne au parseur (sas_parser.py)
+qui y trouve TOUS les DATA steps, IF/ELSE, SELECT, PROC SQL
+de TOUS les fichiers.
+```
+
+**Ordre de recherche des fichiers** :
+
+Quand l'outil rencontre `%include "macros/risque.sas";`, il cherche
+le fichier dans cet ordre :
+
+| Priorite | Ou il cherche                                          | Exemple                              |
+|----------|--------------------------------------------------------|--------------------------------------|
+| 1        | Chemin absolu (si le path commence par `/`)            | `/projets/sas/risque.sas`            |
+| 2        | Relatif au fichier qui fait le `%INCLUDE`              | `./macros/risque.sas`                |
+| 3        | Chaque repertoire `--include-path` (dans l'ordre)      | `/shared/macros/risque.sas`          |
+| 4        | Sous-dossiers du repertoire parent du projet           | `../autre_dossier/risque.sas`        |
+| 5        | Juste le nom du fichier dans les search dirs           | `risque.sas` (sans le dossier)       |
+
+**Patterns reconnus** :
+
+```sas
+%include "chemin/fichier.sas";          /* double quotes — le plus courant */
+%include 'chemin/fichier.sas';          /* single quotes */
+%inc "fichier.sas";                     /* forme courte %inc */
+%include "&RACINE./macros/fichier.sas"; /* variable macro dans le chemin */
+```
+
+**Resolution des variables macro dans les chemins** :
+
+Si un `%INCLUDE` utilise une variable macro (ex: `&ROOT.`), l'outil
+peut la resoudre si tu fournis sa valeur via `--macros` :
+
+```json
+{
+  "ROOT": "/projets/sas/mon_projet"
+}
+```
+
+L'outil remplace `&ROOT.` par `/projets/sas/mon_projet` avant de
+chercher le fichier.
+
+**Protections** :
+
+| Protection                  | Description                                          |
+|-----------------------------|------------------------------------------------------|
+| Detection circulaire        | Si A inclut B et B inclut A → signale erreur, arrete |
+| Profondeur max (20)         | Empeche les boucles infinies                         |
+| Fichier introuvable         | Signale un warning, garde la ligne originale          |
+| Macro non resolue           | Signale un warning, garde `&var.` tel quel           |
+
+**Ce qu'il produit** :
+
+Le `ResolvedSource` retourne contient :
+- `resolved_code` : le code complet avec tout inline
+- `included_files` : la liste de tous les fichiers inclus
+- `source_map` : mapping (ligne debut, ligne fin, fichier source)
+  pour savoir d'ou vient chaque partie du code
+- `errors` : les warnings (fichiers manquants, circulaires, etc.)
+
+---
+
 ## 4. Le pipeline GitLab CI
 
 Le fichier `.gitlab-ci.yml` definit 5 stages sequentiels :
@@ -652,7 +773,139 @@ $ sas-datagen run examples/sample_program.sas \
 
 ---
 
-## 6. Resume
+## 6. Projets multi-fichiers — Comment ca marche
+
+### Le flux complet pour un projet reel
+
+Voici ce qui se passe quand tu lances :
+
+```bash
+sas-datagen run \
+  --project-dir /projets/sas/mon_projet/ \
+  --entry main.sas \
+  --output output/ \
+  --max-iter 5
+```
+
+**Etape 0 : Scan du repertoire**
+
+```
+/projets/sas/mon_projet/
+├── main.sas              <- detecte comme point d'entree
+├── macros/
+│   └── risque.sas        <- trouve par scan recursif
+├── includes/
+│   └── init.sas          <- trouve par scan recursif
+└── programmes/
+    ├── etape1.sas        <- trouve par scan recursif
+    └── etape2.sas        <- trouve par scan recursif
+
+Resultat : 5 fichiers .sas trouves, main.sas = entree
+```
+
+**Etape 1 : Resolution des %INCLUDE**
+
+```
+main.sas contient :
+  %include "macros/risque.sas";
+  %include "includes/init.sas";
+  %include "programmes/etape1.sas";
+  %include "programmes/etape2.sas";
+
+Resolution :
+  macros/risque.sas    → TROUVE (relatif a main.sas)
+  includes/init.sas    → TROUVE
+  programmes/etape1.sas → TROUVE
+  programmes/etape2.sas → TROUVE
+
+Code resolu : 1 seul bloc = main + risque + init + etape1 + etape2
+  ~200 lignes de code SAS total
+```
+
+**Etape 2 : Parsing du code resolu**
+
+```
+Le parseur voit maintenant TOUT le code :
+  - DATA step de etape1.sas : 4 IF/ELSE + 1 SELECT/WHEN
+  - PROC SQL de etape2.sas : 1 WHERE + 1 CASE/WHEN
+  - Code dans risque.sas : 2 IF/ELSE (dans la macro)
+
+Total : 15 points de couverture, 5 variables
+```
+
+**Etapes 3-6 : Identiques au mode fichier unique**
+
+Generation, execution SAS, couverture, mutation — tout fonctionne
+pareil, sauf que le code instrumente contient TOUT le projet inline.
+
+### Les 3 facons d'utiliser l'outil
+
+**Facon 1 : Fichiers individuels (simple, pas d'%INCLUDE)**
+
+```bash
+# Chaque fichier est analyse separement
+sas-datagen run etape1.sas etape2.sas -o output/
+```
+
+Quand utiliser : fichiers SAS autonomes, pas de %INCLUDE entre eux.
+
+**Facon 2 : --project-dir (projet complet)**
+
+```bash
+# Tout le repertoire est scanne, les %INCLUDE sont resolus
+sas-datagen run --project-dir /projets/sas/mon_projet/ --entry main.sas -o output/
+```
+
+Quand utiliser : projet organise avec un main.sas qui inclut les autres.
+
+**Facon 3 : --include-path (macros dans un autre dossier)**
+
+```bash
+# Le fichier fait des %INCLUDE vers des repertoires externes
+sas-datagen run main.sas \
+  --include-path /projets/sas/macros_communes \
+  --include-path /projets/sas/formats \
+  -o output/
+```
+
+Quand utiliser : macros partagees entre projets, dans un dossier
+separe du projet principal.
+
+### Combiner les options
+
+```bash
+# Projet complet + macros partagees + variables macro dans les chemins
+sas-datagen run \
+  --project-dir /projets/sas/mon_projet/ \
+  --entry main.sas \
+  --include-path /projets/sas/macros_communes \
+  --macros config/macros.json \
+  --libnames config/libnames.json \
+  --output output/ \
+  --max-iter 5 \
+  --target 90
+```
+
+### Ce qui se passe en CI/CD
+
+Tu n'as pas besoin de cloner le repo de l'outil. L'installation
+se fait dans le pipeline :
+
+```yaml
+# Dans .gitlab-ci.yml de TON repo SAS
+before_script:
+  - pip install git+https://github.com/yerrochdi/sas_test_generator.git
+
+script:
+  - sas-datagen run --project-dir . --entry main.sas -o output/
+```
+
+Le `.` fait reference au repo clone par GitLab CI — ton repertoire
+de projet SAS. L'outil scanne tout, resout les %INCLUDE, et genere.
+
+---
+
+## 7. Resume
 
 Le projet resout ce probleme :
 
@@ -661,11 +914,12 @@ Le projet resout ce probleme :
 
 Il le fait **sans outil SAS proprietaire**, avec :
 
-| Composant     | Role                                    | Technique utilisee |
-|---------------|-----------------------------------------|--------------------|
-| Parseur       | Comprendre le code SAS                  | Expressions regulieres (regex) |
-| Instrumenteur | Injecter des marqueurs dans le code     | Statements `PUT` dans le log SAS |
-| Generateur    | Creer des donnees ciblees               | Analyse de conditions + valeurs limites |
-| Executeur     | Lancer SAS en batch                     | Commande `sas -batch` |
-| Analyseur     | Mesurer la couverture                   | Grep des marqueurs `COV:POINT=` dans le log |
-| Orchestrateur | Boucler jusqu'a la couverture cible     | Mutation iterative des datasets |
+| Composant       | Role                                    | Technique utilisee |
+|-----------------|-----------------------------------------|--------------------|
+| Resolveur       | Assembler les fichiers multi-%INCLUDE   | Suivi recursif des `%INCLUDE` |
+| Parseur         | Comprendre le code SAS                  | Expressions regulieres (regex) |
+| Instrumenteur   | Injecter des marqueurs dans le code     | Statements `PUT` dans le log SAS |
+| Generateur      | Creer des donnees ciblees               | Analyse de conditions + valeurs limites |
+| Executeur       | Lancer SAS en batch                     | Commande `sas -batch` |
+| Analyseur       | Mesurer la couverture                   | Grep des marqueurs `COV:POINT=` dans le log |
+| Orchestrateur   | Boucler jusqu'a la couverture cible     | Mutation iterative des datasets |
