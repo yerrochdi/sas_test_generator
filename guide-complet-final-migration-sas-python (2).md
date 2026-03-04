@@ -16,7 +16,7 @@ de code SAS, dans le cadre d'une migration vers Python.
 
 Vous n'avez pas besoin d'être expert Python ou en testing pour suivre ce guide.
 Chaque étape est expliquée, et les prompts sont prêts à être copiés-collés
-dans **VSCode Copilote** (l'outil en ligne de commande d'Anthropic).
+dans **VSCode Copilote** (Selection d'un model Claude opus de preference).
 
 ---
 
