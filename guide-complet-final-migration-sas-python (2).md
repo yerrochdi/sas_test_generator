@@ -16,7 +16,7 @@ de code SAS, dans le cadre d'une migration vers Python.
 
 Vous n'avez pas besoin d'être expert Python ou en testing pour suivre ce guide.
 Chaque étape est expliquée, et les prompts sont prêts à être copiés-collés
-dans **Claude Code** (l'outil en ligne de commande d'Anthropic).
+dans **VSCode Copilote** (l'outil en ligne de commande d'Anthropic).
 
 ---
 
@@ -115,7 +115,7 @@ run_sas_param.json
 | **DataFrame** | L'équivalent Python d'un dataset SAS. Un tableau avec des colonnes typées. |
 | **Fixture pytest** | Une fonction Python qui prépare un DataFrame de test. C'est l'équivalent d'un DATA step qui crée un jeu de test. |
 | **Ground truth** | Les résultats réels produits par le SAS original. C'est la référence absolue pour vérifier que le Python fait pareil. |
-| **Claude Code** | L'outil en ligne de commande d'Anthropic qui permet de piloter Claude directement dans un terminal, avec accès à votre système de fichiers local. |
+| **VSCode Copilote** | L'outil en ligne de commande d'Anthropic qui permet de piloter Claude directement dans un terminal, avec accès à votre système de fichiers local. |
 
 ---
 
@@ -128,7 +128,7 @@ Chaque prompt est encadré entre deux lignes de `═` :
 DÉBUT DU PROMPT X
 ════════════════════════════════════════════════════════════
 
-  (le texte à copier-coller dans Claude Code)
+  (le texte à copier-coller dans VSCode Copilote)
 
 ════════════════════════════════════════════════════════════
 FIN DU PROMPT X
@@ -216,7 +216,7 @@ Pour couvrir les 5 branches ci-dessus, il suffit de 3 lignes de données :
 | 2 | 15  | IARD         | age < 18 FAUX, WHEN IARD |
 | 3 | 30  | PREVOYANCE   | age >= 18 VRAI, OTHERWISE |
 
-C'est exactement **ça** que ce guide vous fait générer par Claude Code :
+C'est exactement **ça** que ce guide vous fait générer par VSCode Copilote :
 des lignes de données concrètes, avec les bonnes valeurs aux bons endroits,
 pour chaque programme SAS de votre projet.
 
@@ -1710,7 +1710,7 @@ montant = INPUT(montant_str, COMMA12.2);    /* "1,234.56" → 1234.56 */
 ---
 
 ```
-1. Ouvrez Claude Code dans le dossier de votre projet SAS
+1. Ouvrez VSCode Copilote dans le dossier de votre projet SAS
 
 2. PROMPT 0
    → Claude lit ordonnanceur/run_sas_param.json
